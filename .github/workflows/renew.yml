@@ -5,9 +5,11 @@ on:
 
   schedule:
     # 北京时间星期三 18:30
+    # UTC = 10:30
     - cron: '30 10 * * 3'
 
     # 北京时间星期四 08:15
+    # UTC = 00:15
     - cron: '15 00 * * 4'
 
 permissions:
@@ -31,7 +33,9 @@ jobs:
       - name: 🕐 更新保活时间戳
         run: |
           mkdir -p .github
-          date -u '+%Y-%m-%dT%H:%M:%SZ' > .github/keepalive_timestamp.txt
+
+          date -u '+%Y-%m-%dT%H:%M:%SZ' \
+            > .github/keepalive_timestamp.txt
 
           echo "========================================"
           echo "GitHub Actions 保活"
@@ -107,9 +111,14 @@ jobs:
           test -f package.json && echo "✅ package.json"
           test -f index.js && echo "✅ index.js"
           test -f renew.js && echo "✅ renew.js"
+          test -f login.js && echo "✅ login.js"
 
       # ----------------------------------------------------------
       # 5. 安装 Node.js 依赖
+      #
+      # 注意：
+      # 不使用 cache: npm
+      # 因为当前仓库没有 package-lock.json
       # ----------------------------------------------------------
       - name: 📦 安装 Node.js 依赖
         run: |
@@ -123,15 +132,79 @@ jobs:
           npx playwright install --with-deps chromium
 
       # ----------------------------------------------------------
-      # 7. 运行自动续期
+      # 7. 安装 sing-box
+      #
+      # index.js 明确使用：
+      # ./sing-box run -c config.json
+      # ----------------------------------------------------------
+      - name: ⚙️ 安装 sing-box
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: |
+          echo "========================================"
+          echo "⚙️ 开始安装 sing-box"
+          echo "========================================"
+
+          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+
+          echo ""
+          echo "========== 检查 sing-box =========="
+
+          if [ ! -f "./sing-box" ]; then
+            echo "❌ sing-box 安装失败"
+            echo ""
+            echo "当前目录："
+            pwd
+            echo ""
+            echo "文件列表："
+            ls -lah
+            exit 1
+          fi
+
+          chmod +x ./sing-box
+
+          echo "sing-box 文件："
+          ls -lh ./sing-box
+
+          echo ""
+          echo "sing-box 版本："
+          ./sing-box version
+
+          echo ""
+          echo "✅ sing-box 安装成功"
+
+      # ----------------------------------------------------------
+      # 8. 检查 Chrome
+      # ----------------------------------------------------------
+      - name: 🌐 检查 Google Chrome
+        run: |
+          if command -v google-chrome >/dev/null 2>&1; then
+            echo "✅ Google Chrome:"
+            google-chrome --version
+          else
+            echo "❌ Google Chrome 不存在"
+            exit 1
+          fi
+
+      # ----------------------------------------------------------
+      # 9. 运行 HidenCloud 自动续期
       # ----------------------------------------------------------
       - name: 🚀 运行 HidenCloud 自动续期
         env:
+
+          # ======================================================
+          # HidenCloud 账号
+          # 格式：
+          # email password
+          # ======================================================
           HIDEN_ACCOUNT_1: ${{ secrets.HIDEN_ACCOUNT_1 }}
           HIDEN_ACCOUNT_2: ${{ secrets.HIDEN_ACCOUNT_2 }}
           HIDEN_ACCOUNT_3: ${{ secrets.HIDEN_ACCOUNT_3 }}
           HIDEN_ACCOUNT_4: ${{ secrets.HIDEN_ACCOUNT_4 }}
 
+          # ======================================================
+          # 代理
+          # ======================================================
           PROXY_URL_1: ${{ secrets.PROXY_URL_1 }}
           PROXY_URL_2: ${{ secrets.PROXY_URL_2 }}
           PROXY_URL_3: ${{ secrets.PROXY_URL_3 }}
@@ -142,17 +215,31 @@ jobs:
           PROXY_LOCK_3: ${{ secrets.PROXY_LOCK_3 }}
           PROXY_LOCK_4: ${{ secrets.PROXY_LOCK_4 }}
 
+          # ======================================================
+          # Cookie
+          # index.js 从环境变量读取
+          # ======================================================
           HIDEN_COOKIES_1: ${{ vars.HIDEN_COOKIES_1 }}
           HIDEN_COOKIES_2: ${{ vars.HIDEN_COOKIES_2 }}
           HIDEN_COOKIES_3: ${{ vars.HIDEN_COOKIES_3 }}
           HIDEN_COOKIES_4: ${{ vars.HIDEN_COOKIES_4 }}
 
+          # ======================================================
+          # GitHub API
+          # 用于自动保存新的 Cookie
+          # ======================================================
           GH_PAT: ${{ secrets.GH_PAT }}
           GITHUB_REPO: ${{ github.repository }}
 
+          # ======================================================
+          # Telegram
+          # ======================================================
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT: ${{ secrets.TG_CHAT }}
 
+          # ======================================================
+          # SMTP 邮件
+          # ======================================================
           SMTP_CONFIG: ${{ secrets.SMTP_CONFIG }}
           EMAIL_CHAT: ${{ secrets.EMAIL_CHAT }}
 
@@ -164,7 +251,20 @@ jobs:
           node index.js
 
       # ----------------------------------------------------------
-      # 8. 清理
+      # 10. 保存 state.json
+      # ----------------------------------------------------------
+      - name: 💾 保存运行状态
+        if: always()
+        run: |
+          if [ -f "state.json" ]; then
+            echo "✅ state.json 已生成"
+            cat state.json
+          else
+            echo "⚠️ 未生成 state.json"
+          fi
+
+      # ----------------------------------------------------------
+      # 11. 清理临时文件
       # ----------------------------------------------------------
       - name: 🧽 清理临时文件
         if: always()
@@ -173,14 +273,13 @@ jobs:
           pkill -f chrome || true
           pkill -f chromium || true
 
-          rm -f sing-box
           rm -f config.json
           rm -f singbox_*.log
 
           echo "✅ 清理完成"
 
       # ----------------------------------------------------------
-      # 9. 删除旧运行记录
+      # 12. 删除旧 Workflow 运行记录
       # ----------------------------------------------------------
       - name: 🧹 清理旧的工作流运行记录
         if: always()
