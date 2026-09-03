@@ -32,57 +32,89 @@ class RenewManager {
         console.log(`[${this.maskedUser}] ${msg}`);
     }
 
-    async request(method, url, data = null) {
+    /**
+     * 浏览器导航获取页面
+     *
+     * 不再使用 page.evaluate(fetch(...))
+     * 请求 Dashboard，避免 HidenCloud 返回 403。
+     */
+    async getPage(url, options = {}) {
         const targetUrl = url.startsWith('http')
             ? url
             : `https://dash.hidencloud.com${url.startsWith('/') ? '' : '/'}${url}`;
 
-        const headers = {};
+        this.log(`🌐 打开页面: ${targetUrl}`);
 
-        if (method === 'POST') {
-            headers['Content-Type'] =
-                'application/x-www-form-urlencoded; charset=UTF-8';
-        }
+        try {
+            const response = await this.page.goto(
+                targetUrl,
+                {
+                    waitUntil: 'domcontentloaded',
+                    timeout: options.timeout || 60000
+                }
+            );
 
-        if (this.csrfToken) {
-            headers['X-CSRF-TOKEN'] = this.csrfToken;
+            await SLEEP(1500, 2500);
+
+            const html = await this.page.content();
+
+            return {
+                status: response ? response.status() : 200,
+                finalUrl: this.page.url(),
+                data: html
+            };
+        } catch (error) {
+            throw new Error(
+                `页面访问失败: ${error.message}`
+            );
         }
+    }
+
+    /**
+     * POST 请求
+     *
+     * POST 仍然通过浏览器上下文发送，
+     * 保留 Cookie / Session。
+     */
+    async postPage(url, data = '') {
+        const targetUrl = url.startsWith('http')
+            ? url
+            : `https://dash.hidencloud.com${url.startsWith('/') ? '' : '/'}${url}`;
 
         return await this.page.evaluate(
-            async ({ url, method, data, headers }) => {
-                try {
-                    const options = {
-                        method,
-                        headers,
-                        redirect: 'follow',
-                        credentials: 'include'
-                    };
+            async ({ url, data, csrfToken }) => {
+                const headers = {
+                    'Content-Type':
+                        'application/x-www-form-urlencoded; charset=UTF-8',
+                    'Accept':
+                        'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+                };
 
-                    if (data) {
-                        options.body = data;
-                    }
-
-                    const res = await fetch(url, options);
-
-                    return {
-                        status: res.status,
-                        finalUrl: res.url,
-                        data: await res.text()
-                    };
-                } catch (e) {
-                    return {
-                        status: 0,
-                        finalUrl: url,
-                        data: '',
-                        error: e.message
-                    };
+                if (csrfToken) {
+                    headers['X-CSRF-TOKEN'] = csrfToken;
                 }
+
+                const res = await fetch(
+                    url,
+                    {
+                        method: 'POST',
+                        headers,
+                        body: data,
+                        credentials: 'include',
+                        redirect: 'follow'
+                    }
+                );
+
+                return {
+                    status: res.status,
+                    finalUrl: res.url,
+                    data: await res.text()
+                };
             },
             {
                 url: targetUrl,
-                method,
-                data: data ? data.toString() : null,
-                headers
+                data,
+                csrfToken: this.csrfToken
             }
         );
     }
@@ -92,11 +124,13 @@ class RenewManager {
 
         let dueDateText = '';
 
-        // 原来的结构
         $('h6').each((i, el) => {
-            const title = $(el).text().trim().toLowerCase();
+            const text = $(el)
+                .text()
+                .trim()
+                .toLowerCase();
 
-            if (title === 'due date') {
+            if (text === 'due date') {
                 dueDateText = $(el)
                     .next('div')
                     .text()
@@ -104,7 +138,6 @@ class RenewManager {
             }
         });
 
-        // 兼容更多可能的结构
         if (!dueDateText) {
             $('body *').each((i, el) => {
                 const text = $(el)
@@ -117,13 +150,13 @@ class RenewManager {
                     .toLowerCase();
 
                 if (text === 'due date') {
-                    const nextText = $(el)
+                    const next = $(el)
                         .next()
                         .text()
                         .trim();
 
-                    if (nextText) {
-                        dueDateText = nextText;
+                    if (next) {
+                        dueDateText = next;
                     }
                 }
             });
@@ -133,7 +166,7 @@ class RenewManager {
             return null;
         }
 
-        const timestamp = Date.parse(
+        let timestamp = Date.parse(
             `${dueDateText} 00:00:00 GMT`
         );
 
@@ -141,37 +174,23 @@ class RenewManager {
             return timestamp;
         }
 
-        // 尝试直接解析
-        const timestamp2 = Date.parse(dueDateText);
+        timestamp = Date.parse(dueDateText);
 
-        if (!isNaN(timestamp2)) {
-            return timestamp2;
+        if (!isNaN(timestamp)) {
+            return timestamp;
         }
 
         return null;
     }
 
     /**
-     * 从 Dashboard 中提取服务 ID
-     *
-     * 不再只依赖：
-     * /service/123/manage
-     *
-     * 同时检查：
-     * /service/123
-     * /service/123/
-     * /service/123/manage
-     * data-service-id
-     * data-id
+     * 服务发现
      */
     discoverServices(html) {
         const $ = cheerio.load(html);
         const services = new Set();
 
-        // ============================================================
-        // 1. 检查所有 href
-        // ============================================================
-
+        // 1. href
         $('a[href]').each((i, el) => {
             const href = $(el).attr('href');
 
@@ -192,10 +211,7 @@ class RenewManager {
             }
         });
 
-        // ============================================================
-        // 2. 检查 data-service-id
-        // ============================================================
-
+        // 2. data-service-id
         $('[data-service-id]').each((i, el) => {
             const id = $(el).attr('data-service-id');
 
@@ -204,10 +220,7 @@ class RenewManager {
             }
         });
 
-        // ============================================================
-        // 3. 检查 data-id
-        // ============================================================
-
+        // 3. data-id
         $('[data-id]').each((i, el) => {
             const id = $(el).attr('data-id');
 
@@ -222,17 +235,15 @@ class RenewManager {
             }
         });
 
-        // ============================================================
-        // 4. 检查 HTML 中直接出现的 /service/123
-        // ============================================================
-
-        const htmlMatches = html.match(
+        // 4. HTML 正则
+        const matches = html.match(
             /\/service\/(\d+)(?:\/manage|\/|["'?#])/gi
         );
 
-        if (htmlMatches) {
-            for (const item of htmlMatches) {
-                const match = item.match(/\/service\/(\d+)/i);
+        if (matches) {
+            for (const item of matches) {
+                const match =
+                    item.match(/\/service\/(\d+)/i);
 
                 if (match) {
                     services.add(match[1]);
@@ -243,68 +254,64 @@ class RenewManager {
         return [...services];
     }
 
-    /**
-     * Dashboard 服务发现失败时输出诊断信息
-     */
     async diagnoseDashboard(html) {
         const $ = cheerio.load(html);
 
-        this.log('⚠️ Dashboard 中没有发现服务 ID');
+        this.log('⚠️ Dashboard 没有发现服务');
 
         this.log(
-            `📄 Dashboard URL: ${await this.page.url()}`
+            `📄 当前 URL: ${this.page.url()}`
         );
 
         this.log(
             `📊 HTML 长度: ${html.length}`
         );
 
-        const title = $('title')
-            .text()
-            .trim();
-
         this.log(
-            `📌 页面标题: ${title || '(空)'}`
+            `📌 页面标题: ${
+                $('title').text().trim() || '(空)'
+            }`
         );
 
-        // 输出所有 service 相关链接
-        const serviceLinks = [];
+        const links = [];
 
         $('a[href]').each((i, el) => {
             const href = $(el).attr('href');
-            const text = $(el).text().trim();
+            const text = $(el)
+                .text()
+                .trim();
 
             if (
                 href &&
                 (
                     href.toLowerCase().includes('service') ||
                     text.toLowerCase().includes('service') ||
-                    text.includes('服务器') ||
                     text.includes('服务')
                 )
             ) {
-                serviceLinks.push({
+                links.push({
                     text: text.substring(0, 100),
                     href
                 });
             }
         });
 
-        if (serviceLinks.length > 0) {
+        if (links.length) {
             this.log(
-                `🔎 找到 ${serviceLinks.length} 个疑似服务相关链接:`
+                `🔎 找到 ${links.length} 个服务相关链接`
             );
 
-            for (const item of serviceLinks.slice(0, 30)) {
+            for (const item of links.slice(0, 30)) {
                 this.log(
                     `   ${item.text || '(无文字)'} -> ${item.href}`
                 );
             }
         } else {
-            this.log('❌ 页面中没有发现 service 相关链接');
+            this.log(
+                '❌ 没有发现 service 相关链接'
+            );
         }
 
-        // 检查关键词
         const bodyText = $('body')
             .text()
             .replace(/\s+/g, ' ')
@@ -325,21 +332,13 @@ class RenewManager {
             if (
                 bodyText
                     .toLowerCase()
-                    .includes(keyword.toLowerCase())
+                    .includes(keyword)
             ) {
-                this.log(`🔎 页面包含关键词: ${keyword}`);
+                this.log(
+                    `🔎 页面包含关键词: ${keyword}`
+                );
             }
         }
-
-        // 输出部分 HTML，方便定位页面结构
-        const bodyHtml = $('body').html() || '';
-
-        this.log(
-            `🧩 Body HTML 前 3000 字符:\n${bodyHtml.substring(
-                0,
-                3000
-            )}`
-        );
     }
 
     async execute() {
@@ -347,33 +346,60 @@ class RenewManager {
 
         await SLEEP(2000, 3000);
 
-        const dashRes = await this.request(
-            'GET',
+        // ============================================================
+        // 重要：
+        // 不再 request('GET', '/dashboard')
+        // 改为真实浏览器导航
+        // ============================================================
+
+        const dashRes = await this.getPage(
             '/dashboard'
         );
 
-        if (dashRes.status !== 200) {
+        this.log(
+            `📡 Dashboard HTTP: ${dashRes.status}`
+        );
+
+        this.log(
+            `📍 Dashboard 最终 URL: ${dashRes.finalUrl}`
+        );
+
+        // 登录失效
+        if (
+            dashRes.finalUrl.includes('/login')
+        ) {
             throw new Error(
-                `Dashboard 请求失败: HTTP ${dashRes.status}`
+                '登录态异常失效'
             );
         }
 
-        if (
-            dashRes.finalUrl &&
-            dashRes.finalUrl.includes('/login')
-        ) {
-            throw new Error('登录态异常失效');
-        }
-
-        const $ = cheerio.load(dashRes.data);
+        const $ = cheerio.load(
+            dashRes.data
+        );
 
         const title = $('title')
             .text()
             .trim()
             .toLowerCase();
 
-        if (title.includes('just a moment')) {
-            throw new Error('遇到 Cloudflare 拦截页面');
+        // Cloudflare
+        if (
+            title.includes('just a moment') ||
+            dashRes.data.includes(
+                'cf-chl-'
+            )
+        ) {
+            throw new Error(
+                'Dashboard 遇到 Cloudflare 拦截'
+            );
+        }
+
+        if (
+            dashRes.status >= 400
+        ) {
+            throw new Error(
+                `Dashboard 请求失败: HTTP ${dashRes.status}`
+            );
         }
 
         // ============================================================
@@ -381,35 +407,44 @@ class RenewManager {
         // ============================================================
 
         this.csrfToken =
-            $('meta[name="csrf-token"]').attr('content') ||
-            $('meta[name="csrf_token"]').attr('content') ||
-            $('input[name="_token"]').first().val() ||
+            $('meta[name="csrf-token"]').attr(
+                'content'
+            ) ||
+            $('meta[name="csrf_token"]').attr(
+                'content'
+            ) ||
+            $('input[name="_token"]')
+                .first()
+                .val() ||
             '';
 
         if (this.csrfToken) {
-            this.log('🔐 CSRF Token 已获取');
+            this.log(
+                '🔐 CSRF Token 获取成功'
+            );
         } else {
-            this.log('⚠️ 未找到 CSRF Token');
+            this.log(
+                '⚠️ 未找到 CSRF Token'
+            );
         }
 
         // ============================================================
         // 服务发现
         // ============================================================
 
-        const uniqueServices =
-            this.discoverServices(dashRes.data);
+        const services =
+            this.discoverServices(
+                dashRes.data
+            );
 
-        this.stats.total = uniqueServices.length;
+        this.stats.total =
+            services.length;
 
         this.log(
-            `✅ 发现 ${uniqueServices.length} 个服务`
+            `✅ 发现 ${services.length} 个服务`
         );
 
-        // ============================================================
-        // 发现 0 个服务时，不直接安静退出
-        // ============================================================
-
-        if (uniqueServices.length === 0) {
+        if (services.length === 0) {
             await this.diagnoseDashboard(
                 dashRes.data
             );
@@ -421,33 +456,34 @@ class RenewManager {
             };
         }
 
-        // 输出服务 ID 的 hash，避免日志暴露真实 ID
-        for (const serviceId of uniqueServices) {
-            const hash = crypto
-                .createHash('md5')
-                .update(String(serviceId))
-                .digest('hex')
-                .substring(0, 8);
-
-            this.log(
-                `🔎 服务 ID: [Hash-${hash}]`
-            );
-        }
-
         // ============================================================
-        // 逐个处理
+        // 服务逐个处理
         // ============================================================
 
-        for (const serviceId of uniqueServices) {
+        for (const serviceId of services) {
             try {
-                const finalSvcDate =
-                    await this.processService(serviceId);
+                const hash = crypto
+                    .createHash('md5')
+                    .update(String(serviceId))
+                    .digest('hex')
+                    .substring(0, 8);
+
+                this.log(
+                    `🔎 发现服务 [Hash-${hash}]`
+                );
+
+                const finalDate =
+                    await this.processService(
+                        serviceId
+                    );
 
                 if (
-                    finalSvcDate &&
-                    finalSvcDate > this.latestDueDate
+                    finalDate &&
+                    finalDate >
+                        this.latestDueDate
                 ) {
-                    this.latestDueDate = finalSvcDate;
+                    this.latestDueDate =
+                        finalDate;
                 }
             } catch (error) {
                 this.stats.failed++;
@@ -481,35 +517,46 @@ class RenewManager {
             `>>> 处理服务: [Hash-${svcHash}]`
         );
 
-        const res = await this.request(
-            'GET',
+        // ============================================================
+        // 服务管理页面也使用真实浏览器导航
+        // ============================================================
+
+        const res = await this.getPage(
             `/service/${serviceId}/manage`
         );
 
-        if (res.status !== 200) {
+        if (
+            res.finalUrl.includes('/login')
+        ) {
+            throw new Error(
+                '服务页面登录态失效'
+            );
+        }
+
+        if (res.status >= 400) {
             throw new Error(
                 `服务页面 HTTP ${res.status}`
             );
         }
 
-        if (
-            res.finalUrl &&
-            res.finalUrl.includes('/login')
-        ) {
-            throw new Error('服务页面登录态失效');
-        }
-
-        const $ = cheerio.load(res.data);
+        const $ = cheerio.load(
+            res.data
+        );
 
         const formToken =
-            $('input[name="_token"]').first().val() ||
+            $('input[name="_token"]')
+                .first()
+                .val() ||
             this.csrfToken;
 
         const parsedDate =
-            this.extractDate(res.data);
+            this.extractDate(
+                res.data
+            );
 
         if (parsedDate) {
-            this.state[svcHash] = parsedDate;
+            this.state[svcHash] =
+                parsedDate;
 
             this.log(
                 `📅 当前到期时间: ${new Date(
@@ -518,30 +565,34 @@ class RenewManager {
             );
         } else {
             this.log(
-                '⚠️ 未能从服务页面解析 Due Date'
+                '⚠️ 未找到 Due Date'
             );
         }
 
         // ============================================================
-        // 判断是否需要续期
+        // 判断续期
         // ============================================================
 
         let needsRenew = true;
 
         if (this.state[svcHash]) {
             const remaining =
-                this.state[svcHash] - Date.now();
+                this.state[svcHash] -
+                Date.now();
 
-            const remainingHours =
+            const hours =
                 remaining / 3600000;
 
             this.log(
-                `⏱️ 剩余约 ${remainingHours.toFixed(
+                `⏱️ 剩余约 ${hours.toFixed(
                     2
                 )} 小时`
             );
 
-            if (remaining > 86400000) {
+            if (
+                remaining >
+                86400000
+            ) {
                 this.log(
                     '⏭️ 剩余时间 > 24H，无需续期'
                 );
@@ -565,60 +616,69 @@ class RenewManager {
 
         if (!formToken) {
             throw new Error(
-                '没有找到续期所需的 CSRF Token'
+                '没有找到续期 CSRF Token'
             );
         }
 
-        const params = new URLSearchParams({
-            _token: formToken,
-            days: String(RENEW_DAYS)
-        });
+        const params =
+            new URLSearchParams({
+                _token: formToken,
+                days: String(
+                    RENEW_DAYS
+                )
+            });
 
-        const renewRes = await this.request(
-            'POST',
-            `/service/${serviceId}/renew`,
-            params.toString()
-        );
+        const renewRes =
+            await this.postPage(
+                `/service/${serviceId}/renew`,
+                params.toString()
+            );
 
         this.log(
             `📡 续期响应: HTTP ${renewRes.status}`
         );
 
-        if (renewRes.finalUrl) {
-            this.log(
-                `➡️ 最终 URL: ${renewRes.finalUrl}`
-            );
-        }
+        this.log(
+            `➡️ 最终 URL: ${renewRes.finalUrl}`
+        );
 
-        if (renewRes.status >= 400) {
+        if (
+            renewRes.status >= 400
+        ) {
             this.log(
-                `⚠️ 续期请求失败:\n${renewRes.data.substring(
+                `⚠️ 续期失败:\n${renewRes.data.substring(
                     0,
                     1500
                 )}`
             );
 
             this.stats.failed++;
-            return this.state[svcHash];
+
+            return this.state[
+                svcHash
+            ];
         }
 
         let isPaid = false;
 
         if (
             renewRes.finalUrl &&
-            renewRes.finalUrl.includes('/invoice/')
+            renewRes.finalUrl.includes(
+                '/invoice/'
+            )
         ) {
             this.log(
-                '⚡️ 续期成功，前往支付'
+                '⚡️ 续期成功，进入账单'
             );
 
-            isPaid = await this.payFromHtml(
-                renewRes.data,
-                renewRes.finalUrl
-            );
+            isPaid =
+                await this.payFromHtml(
+                    renewRes.data,
+                    renewRes.finalUrl
+                );
         } else {
             this.log(
-                '⚠️ 续期未直接跳转，检查未支付账单...'
+                '⚠️ 未直接跳转账单，检查未支付账单...'
             );
 
             isPaid =
@@ -631,14 +691,13 @@ class RenewManager {
             this.stats.success++;
 
             this.log(
-                '🔄 支付成功，重新刷新页面获取最新到期日...'
+                '🔄 支付成功，重新获取到期日期...'
             );
 
             await SLEEP(2000, 3000);
 
             const refreshRes =
-                await this.request(
-                    'GET',
+                await this.getPage(
                     `/service/${serviceId}/manage`
                 );
 
@@ -648,7 +707,8 @@ class RenewManager {
                 );
 
             if (newDate) {
-                this.state[svcHash] = newDate;
+                this.state[svcHash] =
+                    newDate;
 
                 this.log(
                     `✅ 新到期时间: ${new Date(
@@ -660,22 +720,24 @@ class RenewManager {
             this.stats.failed++;
 
             this.log(
-                '❌ 续期/支付没有完成'
+                '❌ 续期或支付未完成'
             );
         }
 
-        return this.state[svcHash];
+        return this.state[
+            svcHash
+        ];
     }
 
     async checkUnpaidInvoices(serviceId) {
         await SLEEP(1500, 2500);
 
-        const res = await this.request(
-            'GET',
-            `/service/${serviceId}/invoices?where=unpaid`
-        );
+        const res =
+            await this.getPage(
+                `/service/${serviceId}/invoices?where=unpaid`
+            );
 
-        if (res.status !== 200) {
+        if (res.status >= 400) {
             this.log(
                 `⚠️ 查询账单失败: HTTP ${res.status}`
             );
@@ -683,7 +745,9 @@ class RenewManager {
             return false;
         }
 
-        const $ = cheerio.load(res.data);
+        const $ = cheerio.load(
+            res.data
+        );
 
         const urls = new Set();
 
@@ -694,7 +758,9 @@ class RenewManager {
 
                 if (
                     href &&
-                    !href.includes('download')
+                    !href.includes(
+                        'download'
+                    )
                 ) {
                     urls.add(href);
                 }
@@ -703,7 +769,7 @@ class RenewManager {
 
         if (urls.size === 0) {
             this.log(
-                '⚪ 无未支付账单'
+                '⚪ 没有未支付账单'
             );
 
             return false;
@@ -713,12 +779,11 @@ class RenewManager {
 
         for (const url of urls) {
             this.log(
-                '📄 打开并支付系统生成的账单...'
+                '📄 打开未支付账单...'
             );
 
             const invRes =
-                await this.request(
-                    'GET',
+                await this.getPage(
                     url
                 );
 
@@ -739,51 +804,65 @@ class RenewManager {
     }
 
     async payFromHtml(html, url) {
-        const $ = cheerio.load(html);
+        const $ = cheerio.load(
+            html
+        );
 
         let targetForm = null;
         let action = '';
 
-        // ============================================================
-        // 找支付表单
-        // ============================================================
+        $('form').each(
+            (i, form) => {
+                const btnText =
+                    $(form)
+                        .find(
+                            'button, input[type="submit"]'
+                        )
+                        .text()
+                        .trim()
+                        .toLowerCase();
 
-        $('form').each((i, form) => {
-            const btnText = $(form)
-                .find('button, input[type="submit"]')
-                .text()
-                .trim()
-                .toLowerCase();
+                const formText =
+                    $(form)
+                        .text()
+                        .trim()
+                        .toLowerCase();
 
-            const act =
-                $(form).attr('action') || '';
+                const act =
+                    $(form).attr(
+                        'action'
+                    ) || '';
 
-            const formText =
-                $(form)
-                    .text()
-                    .trim()
-                    .toLowerCase();
+                if (
+                    (
+                        btnText.includes(
+                            'pay'
+                        ) ||
+                        btnText.includes(
+                            '支付'
+                        ) ||
+                        formText.includes(
+                            'pay invoice'
+                        )
+                    ) &&
+                    act &&
+                    !act.includes(
+                        'balance/add'
+                    )
+                ) {
+                    targetForm =
+                        $(form);
 
-            if (
-                (
-                    btnText.includes('pay') ||
-                    btnText.includes('pagar') ||
-                    btnText.includes('支付') ||
-                    formText.includes('pay invoice')
-                ) &&
-                act &&
-                !act.includes('balance/add')
-            ) {
-                targetForm = $(form);
-                action = act;
+                    action = act;
 
-                return false;
+                    return false;
+                }
             }
-        });
+        );
 
         if (!targetForm) {
             this.log(
-                '⚪ 页面未找到支付表单（可能已支付）'
+                '⚪ 未找到支付表单（可能已经支付）'
             );
 
             return true;
@@ -792,16 +871,22 @@ class RenewManager {
         const params =
             new URLSearchParams();
 
-        targetForm.find('input').each(
-            (i, el) => {
+        targetForm
+            .find('input')
+            .each((i, el) => {
                 const name =
-                    $(el).attr('name');
+                    $(el).attr(
+                        'name'
+                    );
 
                 if (!name) return;
 
                 const type =
-                    ($(el).attr('type') || '')
-                        .toLowerCase();
+                    (
+                        $(el).attr(
+                            'type'
+                        ) || ''
+                    ).toLowerCase();
 
                 if (
                     type === 'checkbox' &&
@@ -814,14 +899,14 @@ class RenewManager {
                     name,
                     $(el).val() || ''
                 );
-            }
+            });
+
+        this.log(
+            '💳 提交支付...'
         );
 
-        this.log('💳 提交支付...');
-
         const res =
-            await this.request(
-                'POST',
+            await this.postPage(
                 action,
                 params.toString()
             );
@@ -831,7 +916,7 @@ class RenewManager {
             res.status < 400
         ) {
             this.log(
-                '✅ 支付请求提交成功'
+                '✅ 支付请求成功'
             );
 
             return true;
