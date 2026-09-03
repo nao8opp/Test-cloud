@@ -1,21 +1,22 @@
 const cheerio = require('cheerio');
 const crypto = require('crypto');
 
+const BASE_URL = 'https://dash.hidencloud.com';
 const RENEW_DAYS = 10;
 
-const SLEEP = (min = 3000, max = 5000) =>
-    new Promise(r =>
-        setTimeout(
-            r,
-            Math.floor(Math.random() * (max - min + 1)) + min
-        )
-    );
+const SLEEP = (min = 2000, max = 4000) =>
+    new Promise(resolve => {
+        const delay =
+            Math.floor(Math.random() * (max - min + 1)) + min;
+        setTimeout(resolve, delay);
+    });
 
 class RenewManager {
     constructor(page, userState, maskedUser) {
         this.page = page;
         this.maskedUser = maskedUser;
         this.state = userState || {};
+
         this.csrfToken = '';
 
         this.stats = {
@@ -28,153 +29,509 @@ class RenewManager {
         this.latestDueDate = 0;
     }
 
-    log(msg) {
-        console.log(`[${this.maskedUser}] ${msg}`);
+    log(message) {
+        console.log(`[${this.maskedUser}] ${message}`);
     }
 
     /**
-     * 浏览器导航获取页面
+     * ============================================================
+     * Cloudflare 检测
+     * ============================================================
      *
-     * 不再使用 page.evaluate(fetch(...))
-     * 请求 Dashboard，避免 HidenCloud 返回 403。
+     * 参考 Python 版本 handle_cloudflare()
      */
-    async getPage(url, options = {}) {
-        const targetUrl = url.startsWith('http')
-            ? url
-            : `https://dash.hidencloud.com${url.startsWith('/') ? '' : '/'}${url}`;
+    async handleCloudflare(timeout = 90000) {
+        const startTime = Date.now();
+
+        const iframeSelector =
+            'iframe[src*="challenges.cloudflare.com"]';
+
+        let detected = false;
+
+        try {
+            detected =
+                await this.page.locator(
+                    iframeSelector
+                ).count() > 0;
+        } catch {
+            detected = false;
+        }
+
+        if (!detected) {
+            // 有些情况下 Cloudflare challenge 不一定立即表现为 iframe
+            const title =
+                (await this.page.title()).toLowerCase();
+
+            const bodyText =
+                (
+                    await this.page.locator('body').innerText()
+                ).toLowerCase();
+
+            if (
+                title.includes('just a moment') ||
+                bodyText.includes('verify you are human') ||
+                bodyText.includes('checking your browser') ||
+                bodyText.includes('performing security verification')
+            ) {
+                detected = true;
+            }
+        }
+
+        if (!detected) {
+            return true;
+        }
+
+        this.log('⚠️ 检测到 Cloudflare 验证，等待验证完成...');
+
+        while (Date.now() - startTime < timeout) {
+            try {
+                const count =
+                    await this.page.locator(
+                        iframeSelector
+                    ).count();
+
+                if (count === 0) {
+                    const title =
+                        (await this.page.title()).toLowerCase();
+
+                    if (
+                        !title.includes('just a moment')
+                    ) {
+                        this.log(
+                            '✅ Cloudflare 验证页面已消失'
+                        );
+
+                        await SLEEP(2000, 3000);
+                        return true;
+                    }
+                }
+
+                // 尝试检测 challenge iframe
+                if (count > 0) {
+                    try {
+                        const frame =
+                            this.page.frameLocator(
+                                iframeSelector
+                            );
+
+                        const checkbox =
+                            frame.locator(
+                                'input[type="checkbox"]'
+                            );
+
+                        if (
+                            await checkbox.isVisible({
+                                timeout: 1000
+                            })
+                        ) {
+                            this.log(
+                                '🖱️ 检测到 Cloudflare 验证控件'
+                            );
+
+                            await checkbox.click({
+                                timeout: 5000
+                            });
+
+                            this.log(
+                                '⏳ 已尝试验证，等待 Cloudflare...'
+                            );
+                        }
+                    } catch {
+                        // Cloudflare 不一定使用可点击 checkbox
+                    }
+                }
+            } catch {
+                // 页面正在跳转时忽略
+            }
+
+            await SLEEP(1000, 2000);
+        }
+
+        this.log('❌ Cloudflare 验证等待超时');
+
+        try {
+            await this.page.screenshot({
+                path: `cloudflare_timeout_${Date.now()}.png`,
+                fullPage: true
+            });
+        } catch {}
+
+        return false;
+    }
+
+    /**
+     * ============================================================
+     * 打开页面
+     * ============================================================
+     */
+    async goto(url, timeout = 60000) {
+        const targetUrl =
+            url.startsWith('http')
+                ? url
+                : `${BASE_URL}${url}`;
 
         this.log(`🌐 打开页面: ${targetUrl}`);
 
         try {
-            const response = await this.page.goto(
+            await this.page.goto(
                 targetUrl,
                 {
                     waitUntil: 'domcontentloaded',
-                    timeout: options.timeout || 60000
+                    timeout
                 }
             );
-
-            await SLEEP(1500, 2500);
-
-            const html = await this.page.content();
-
-            return {
-                status: response ? response.status() : 200,
-                finalUrl: this.page.url(),
-                data: html
-            };
         } catch (error) {
-            throw new Error(
-                `页面访问失败: ${error.message}`
+            /*
+             * Cloudflare / 页面导航过程中可能出现 timeout，
+             * 不立即退出，继续检查当前页面。
+             */
+            this.log(
+                `⚠️ 页面导航提示: ${error.message}`
             );
         }
+
+        // 给 Cloudflare / 页面 JS 一点启动时间
+        await SLEEP(1500, 2500);
+
+        // 重要：和 Python 版本一样
+        await this.handleCloudflare();
+
+        // 再等待页面稳定
+        await SLEEP(1500, 2500);
+
+        return {
+            url: this.page.url(),
+            title: await this.page.title(),
+            html: await this.page.content()
+        };
     }
 
     /**
-     * POST 请求
-     *
-     * POST 仍然通过浏览器上下文发送，
-     * 保留 Cookie / Session。
+     * ============================================================
+     * Dashboard
+     * ============================================================
      */
-    async postPage(url, data = '') {
-        const targetUrl = url.startsWith('http')
-            ? url
-            : `https://dash.hidencloud.com${url.startsWith('/') ? '' : '/'}${url}`;
+    async getDashboard() {
+        const result =
+            await this.goto('/dashboard');
 
-        return await this.page.evaluate(
-            async ({ url, data, csrfToken }) => {
-                const headers = {
-                    'Content-Type':
-                        'application/x-www-form-urlencoded; charset=UTF-8',
-                    'Accept':
-                        'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-                };
-
-                if (csrfToken) {
-                    headers['X-CSRF-TOKEN'] = csrfToken;
-                }
-
-                const res = await fetch(
-                    url,
-                    {
-                        method: 'POST',
-                        headers,
-                        body: data,
-                        credentials: 'include',
-                        redirect: 'follow'
-                    }
-                );
-
-                return {
-                    status: res.status,
-                    finalUrl: res.url,
-                    data: await res.text()
-                };
-            },
-            {
-                url: targetUrl,
-                data,
-                csrfToken: this.csrfToken
-            }
+        this.log(
+            `📍 当前 URL: ${result.url}`
         );
+
+        this.log(
+            `📌 当前 Title: ${result.title}`
+        );
+
+        this.log(
+            `📊 页面长度: ${result.html.length}`
+        );
+
+        if (
+            result.url.includes('/auth/login') ||
+            result.url.includes('/login')
+        ) {
+            throw new Error(
+                '登录态异常失效'
+            );
+        }
+
+        const title =
+            result.title.toLowerCase();
+
+        if (
+            title.includes('just a moment')
+        ) {
+            throw new Error(
+                'Cloudflare 验证未完成'
+            );
+        }
+
+        if (
+            result.html.includes(
+                'cf-chl-'
+            )
+        ) {
+            throw new Error(
+                'Cloudflare Challenge 仍未完成'
+            );
+        }
+
+        return result.html;
     }
 
+    /**
+     * ============================================================
+     * 从 Dashboard 获取服务 ID
+     *
+     * 参考你的 Python：
+     *
+     * 1. /service/123/manage
+     * 2. #218079
+     * ============================================================
+     */
+    discoverServices(html) {
+        const $ = cheerio.load(html);
+
+        const services = new Set();
+
+        // ========================================================
+        // 方法 1
+        // /service/123/manage
+        // ========================================================
+
+        const manageMatches =
+            html.match(
+                /\/service\/(\d+)\/manage/gi
+            );
+
+        if (manageMatches) {
+            for (const item of manageMatches) {
+                const match =
+                    item.match(
+                        /\/service\/(\d+)\/manage/i
+                    );
+
+                if (match) {
+                    services.add(match[1]);
+                }
+            }
+        }
+
+        // ========================================================
+        // 方法 2
+        // 任意 /service/123
+        // ========================================================
+
+        const serviceMatches =
+            html.match(
+                /\/service\/(\d+)(?:\/|["'?#])/gi
+            );
+
+        if (serviceMatches) {
+            for (const item of serviceMatches) {
+                const match =
+                    item.match(
+                        /\/service\/(\d+)/i
+                    );
+
+                if (match) {
+                    services.add(match[1]);
+                }
+            }
+        }
+
+        // ========================================================
+        // 方法 3
+        // #218079
+        // ========================================================
+
+        const numberMatches =
+            html.match(
+                /#(\d{4,})/g
+            );
+
+        if (numberMatches) {
+            for (const item of numberMatches) {
+                const match =
+                    item.match(
+                        /#(\d{4,})/
+                    );
+
+                if (match) {
+                    services.add(match[1]);
+                }
+            }
+        }
+
+        // ========================================================
+        // 方法 4
+        // data-service-id
+        // ========================================================
+
+        $('[data-service-id]').each(
+            (i, el) => {
+                const id =
+                    $(el).attr(
+                        'data-service-id'
+                    );
+
+                if (
+                    id &&
+                    /^\d+$/.test(id)
+                ) {
+                    services.add(id);
+                }
+            }
+        );
+
+        return [...services];
+    }
+
+    /**
+     * ============================================================
+     * 服务发现失败诊断
+     * ============================================================
+     */
+    async diagnose(html) {
+        const $ = cheerio.load(html);
+
+        this.log('❌ Dashboard 中没有找到 Server ID');
+
+        this.log(
+            `📄 当前 URL: ${this.page.url()}`
+        );
+
+        this.log(
+            `📌 页面 Title: ${await this.page.title()}`
+        );
+
+        this.log(
+            `📊 HTML 长度: ${html.length}`
+        );
+
+        const serviceLinks = [];
+
+        $('a[href]').each((i, el) => {
+            const href =
+                $(el).attr('href');
+
+            const text =
+                $(el)
+                    .text()
+                    .trim();
+
+            if (
+                href &&
+                href.toLowerCase().includes('service')
+            ) {
+                serviceLinks.push({
+                    text,
+                    href
+                });
+            }
+        });
+
+        if (serviceLinks.length > 0) {
+            this.log(
+                `🔎 找到 ${serviceLinks.length} 个 service 链接`
+            );
+
+            for (
+                const item
+                of serviceLinks.slice(0, 30)
+            ) {
+                this.log(
+                    `   ${item.text || '(无文字)'} -> ${item.href}`
+                );
+            }
+        } else {
+            this.log(
+                '❌ 没有找到 service 链接'
+            );
+        }
+
+        // 输出页面中的 #数字
+        const ids =
+            html.match(/#\d{4,}/g);
+
+        if (ids && ids.length) {
+            this.log(
+                `🔎 页面发现疑似 Server ID: ${
+                    [...new Set(ids)]
+                        .slice(0, 30)
+                        .join(', ')
+                }`
+            );
+        }
+
+        try {
+            await this.page.screenshot({
+                path: 'dashboard_debug.png',
+                fullPage: true
+            });
+
+            this.log(
+                '📸 已保存 dashboard_debug.png'
+            );
+        } catch {}
+    }
+
+    /**
+     * ============================================================
+     * 提取到期时间
+     * ============================================================
+     */
     extractDate(html) {
         const $ = cheerio.load(html);
 
         let dueDateText = '';
 
+        // 原始结构
         $('h6').each((i, el) => {
-            const text = $(el)
-                .text()
-                .trim()
-                .toLowerCase();
-
-            if (text === 'due date') {
-                dueDateText = $(el)
-                    .next('div')
-                    .text()
-                    .trim();
-            }
-        });
-
-        if (!dueDateText) {
-            $('body *').each((i, el) => {
-                const text = $(el)
-                    .clone()
-                    .children()
-                    .remove()
-                    .end()
+            const title =
+                $(el)
                     .text()
                     .trim()
                     .toLowerCase();
 
-                if (text === 'due date') {
-                    const next = $(el)
-                        .next()
+            if (
+                title === 'due date'
+            ) {
+                dueDateText =
+                    $(el)
+                        .next('div')
                         .text()
                         .trim();
+            }
+        });
 
-                    if (next) {
-                        dueDateText = next;
-                    }
+        // Python 版本使用 body.inner_text()
+        // 这里也使用相同思路
+        if (!dueDateText) {
+            const bodyText =
+                $('body')
+                    .text()
+                    .replace(/\s+/g, ' ')
+                    .trim();
+
+            const patterns = [
+                /Due date\s+(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})/i,
+                /Due date\s*\n?\s*(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})/i,
+                /Due date.*?(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})/i
+            ];
+
+            for (const pattern of patterns) {
+                const match =
+                    bodyText.match(
+                        pattern
+                    );
+
+                if (match) {
+                    dueDateText =
+                        match[1].trim();
+                    break;
                 }
-            });
+            }
         }
 
         if (!dueDateText) {
             return null;
         }
 
-        let timestamp = Date.parse(
-            `${dueDateText} 00:00:00 GMT`
-        );
+        let timestamp =
+            Date.parse(
+                `${dueDateText} 00:00:00 GMT`
+            );
 
         if (!isNaN(timestamp)) {
             return timestamp;
         }
 
-        timestamp = Date.parse(dueDateText);
+        timestamp =
+            Date.parse(
+                dueDateText
+            );
 
         if (!isNaN(timestamp)) {
             return timestamp;
@@ -184,375 +541,60 @@ class RenewManager {
     }
 
     /**
-     * 服务发现
+     * ============================================================
+     * 获取服务页面
+     * ============================================================
      */
-    discoverServices(html) {
-        const $ = cheerio.load(html);
-        const services = new Set();
-
-        // 1. href
-        $('a[href]').each((i, el) => {
-            const href = $(el).attr('href');
-
-            if (!href) return;
-
-            const patterns = [
-                /\/service\/(\d+)\/manage/i,
-                /\/service\/(\d+)(?:\/|$|\?)/i
-            ];
-
-            for (const pattern of patterns) {
-                const match = href.match(pattern);
-
-                if (match) {
-                    services.add(match[1]);
-                    break;
-                }
-            }
-        });
-
-        // 2. data-service-id
-        $('[data-service-id]').each((i, el) => {
-            const id = $(el).attr('data-service-id');
-
-            if (id && /^\d+$/.test(id)) {
-                services.add(id);
-            }
-        });
-
-        // 3. data-id
-        $('[data-id]').each((i, el) => {
-            const id = $(el).attr('data-id');
-
-            if (
-                id &&
-                /^\d+$/.test(id) &&
-                $(el).closest(
-                    '[class*="service"], [id*="service"]'
-                ).length
-            ) {
-                services.add(id);
-            }
-        });
-
-        // 4. HTML 正则
-        const matches = html.match(
-            /\/service\/(\d+)(?:\/manage|\/|["'?#])/gi
-        );
-
-        if (matches) {
-            for (const item of matches) {
-                const match =
-                    item.match(/\/service\/(\d+)/i);
-
-                if (match) {
-                    services.add(match[1]);
-                }
-            }
-        }
-
-        return [...services];
-    }
-
-    async diagnoseDashboard(html) {
-        const $ = cheerio.load(html);
-
-        this.log('⚠️ Dashboard 没有发现服务');
-
-        this.log(
-            `📄 当前 URL: ${this.page.url()}`
-        );
-
-        this.log(
-            `📊 HTML 长度: ${html.length}`
-        );
-
-        this.log(
-            `📌 页面标题: ${
-                $('title').text().trim() || '(空)'
-            }`
-        );
-
-        const links = [];
-
-        $('a[href]').each((i, el) => {
-            const href = $(el).attr('href');
-            const text = $(el)
-                .text()
-                .trim();
-
-            if (
-                href &&
-                (
-                    href.toLowerCase().includes('service') ||
-                    text.toLowerCase().includes('service') ||
-                    text.includes('服务')
-                )
-            ) {
-                links.push({
-                    text: text.substring(0, 100),
-                    href
-                });
-            }
-        });
-
-        if (links.length) {
-            this.log(
-                `🔎 找到 ${links.length} 个服务相关链接`
+    async getService(serviceId) {
+        const result =
+            await this.goto(
+                `/service/${serviceId}/manage`
             );
-
-            for (const item of links.slice(0, 30)) {
-                this.log(
-                    `   ${item.text || '(无文字)'} -> ${item.href}`
-                );
-            }
-        } else {
-            this.log(
-                '❌ 没有发现 service 相关链接'
-            );
-        }
-
-        const bodyText = $('body')
-            .text()
-            .replace(/\s+/g, ' ')
-            .trim();
-
-        const keywords = [
-            'service',
-            'services',
-            'server',
-            'servers',
-            'renew',
-            'dashboard',
-            'invoice',
-            'due date'
-        ];
-
-        for (const keyword of keywords) {
-            if (
-                bodyText
-                    .toLowerCase()
-                    .includes(keyword)
-            ) {
-                this.log(
-                    `🔎 页面包含关键词: ${keyword}`
-                );
-            }
-        }
-    }
-
-    async execute() {
-        this.log('🔍 初始化 API 状态...');
-
-        await SLEEP(2000, 3000);
-
-        // ============================================================
-        // 重要：
-        // 不再 request('GET', '/dashboard')
-        // 改为真实浏览器导航
-        // ============================================================
-
-        const dashRes = await this.getPage(
-            '/dashboard'
-        );
-
-        this.log(
-            `📡 Dashboard HTTP: ${dashRes.status}`
-        );
-
-        this.log(
-            `📍 Dashboard 最终 URL: ${dashRes.finalUrl}`
-        );
-
-        // 登录失效
-        if (
-            dashRes.finalUrl.includes('/login')
-        ) {
-            throw new Error(
-                '登录态异常失效'
-            );
-        }
-
-        const $ = cheerio.load(
-            dashRes.data
-        );
-
-        const title = $('title')
-            .text()
-            .trim()
-            .toLowerCase();
-
-        // Cloudflare
-        if (
-            title.includes('just a moment') ||
-            dashRes.data.includes(
-                'cf-chl-'
-            )
-        ) {
-            throw new Error(
-                'Dashboard 遇到 Cloudflare 拦截'
-            );
-        }
 
         if (
-            dashRes.status >= 400
-        ) {
-            throw new Error(
-                `Dashboard 请求失败: HTTP ${dashRes.status}`
-            );
-        }
-
-        // ============================================================
-        // CSRF
-        // ============================================================
-
-        this.csrfToken =
-            $('meta[name="csrf-token"]').attr(
-                'content'
-            ) ||
-            $('meta[name="csrf_token"]').attr(
-                'content'
-            ) ||
-            $('input[name="_token"]')
-                .first()
-                .val() ||
-            '';
-
-        if (this.csrfToken) {
-            this.log(
-                '🔐 CSRF Token 获取成功'
-            );
-        } else {
-            this.log(
-                '⚠️ 未找到 CSRF Token'
-            );
-        }
-
-        // ============================================================
-        // 服务发现
-        // ============================================================
-
-        const services =
-            this.discoverServices(
-                dashRes.data
-            );
-
-        this.stats.total =
-            services.length;
-
-        this.log(
-            `✅ 发现 ${services.length} 个服务`
-        );
-
-        if (services.length === 0) {
-            await this.diagnoseDashboard(
-                dashRes.data
-            );
-
-            return {
-                stats: this.stats,
-                newState: this.state,
-                latestDueDate: null
-            };
-        }
-
-        // ============================================================
-        // 服务逐个处理
-        // ============================================================
-
-        for (const serviceId of services) {
-            try {
-                const hash = crypto
-                    .createHash('md5')
-                    .update(String(serviceId))
-                    .digest('hex')
-                    .substring(0, 8);
-
-                this.log(
-                    `🔎 发现服务 [Hash-${hash}]`
-                );
-
-                const finalDate =
-                    await this.processService(
-                        serviceId
-                    );
-
-                if (
-                    finalDate &&
-                    finalDate >
-                        this.latestDueDate
-                ) {
-                    this.latestDueDate =
-                        finalDate;
-                }
-            } catch (error) {
-                this.stats.failed++;
-
-                this.log(
-                    `❌ 服务处理失败: ${error.message}`
-                );
-            }
-        }
-
-        return {
-            stats: this.stats,
-            newState: this.state,
-            latestDueDate:
-                this.latestDueDate === 0
-                    ? null
-                    : this.latestDueDate
-        };
-    }
-
-    async processService(serviceId) {
-        await SLEEP(2000, 3000);
-
-        const svcHash = crypto
-            .createHash('md5')
-            .update(String(serviceId))
-            .digest('hex')
-            .substring(0, 8);
-
-        this.log(
-            `>>> 处理服务: [Hash-${svcHash}]`
-        );
-
-        // ============================================================
-        // 服务管理页面也使用真实浏览器导航
-        // ============================================================
-
-        const res = await this.getPage(
-            `/service/${serviceId}/manage`
-        );
-
-        if (
-            res.finalUrl.includes('/login')
+            result.url.includes('/login') ||
+            result.url.includes('/auth/login')
         ) {
             throw new Error(
                 '服务页面登录态失效'
             );
         }
 
-        if (res.status >= 400) {
-            throw new Error(
-                `服务页面 HTTP ${res.status}`
-            );
-        }
+        return result;
+    }
 
-        const $ = cheerio.load(
-            res.data
+    /**
+     * ============================================================
+     * 处理服务
+     * ============================================================
+     */
+    async processService(serviceId) {
+        await SLEEP(2000, 3500);
+
+        const svcHash =
+            crypto
+                .createHash('md5')
+                .update(String(serviceId))
+                .digest('hex')
+                .substring(0, 8);
+
+        this.log(
+            `>>> 处理服务: [Hash-${svcHash}]`
         );
 
-        const formToken =
-            $('input[name="_token"]')
-                .first()
-                .val() ||
-            this.csrfToken;
+        const result =
+            await this.getService(
+                serviceId
+            );
+
+        const html =
+            result.html;
+
+        const $ =
+            cheerio.load(html);
 
         const parsedDate =
-            this.extractDate(
-                res.data
-            );
+            this.extractDate(html);
 
         if (parsedDate) {
             this.state[svcHash] =
@@ -565,15 +607,13 @@ class RenewManager {
             );
         } else {
             this.log(
-                '⚠️ 未找到 Due Date'
+                '⚠️ 无法解析 Due Date'
             );
         }
 
-        // ============================================================
-        // 判断续期
-        // ============================================================
-
-        let needsRenew = true;
+        // ========================================================
+        // 判断是否需要续期
+        // ========================================================
 
         if (this.state[svcHash]) {
             const remaining =
@@ -598,59 +638,40 @@ class RenewManager {
                 );
 
                 this.stats.skipped++;
-                needsRenew = false;
+
+                return this.state[
+                    svcHash
+                ];
             }
         }
 
-        if (!needsRenew) {
-            return this.state[svcHash];
-        }
-
-        // ============================================================
-        // 续期
-        // ============================================================
+        // ========================================================
+        // 查找 Renew 按钮
+        // ========================================================
 
         this.log(
-            `📅 提交续期 (${RENEW_DAYS}天)...`
+            "🖱️ 准备查找 'Renew' 按钮..."
         );
 
-        if (!formToken) {
-            throw new Error(
-                '没有找到续期 CSRF Token'
-            );
-        }
+        const renewButton =
+            this.page.locator(
+                'button:has-text("Renew"), a:has-text("Renew")'
+            ).first;
 
-        const params =
-            new URLSearchParams({
-                _token: formToken,
-                days: String(
-                    RENEW_DAYS
-                )
+        try {
+            await renewButton.waitFor({
+                state: 'visible',
+                timeout: 15000
             });
-
-        const renewRes =
-            await this.postPage(
-                `/service/${serviceId}/renew`,
-                params.toString()
-            );
-
-        this.log(
-            `📡 续期响应: HTTP ${renewRes.status}`
-        );
-
-        this.log(
-            `➡️ 最终 URL: ${renewRes.finalUrl}`
-        );
-
-        if (
-            renewRes.status >= 400
-        ) {
+        } catch {
             this.log(
-                `⚠️ 续期失败:\n${renewRes.data.substring(
-                    0,
-                    1500
-                )}`
+                "❌ 未找到 'Renew' 按钮"
             );
+
+            await this.page.screenshot({
+                path: `renew_button_missing_${svcHash}.png`,
+                fullPage: true
+            });
 
             this.stats.failed++;
 
@@ -659,274 +680,344 @@ class RenewManager {
             ];
         }
 
-        let isPaid = false;
+        await renewButton.scrollIntoViewIfNeeded();
+
+        this.log(
+            "🖱️ 点击 'Renew'..."
+        );
+
+        await renewButton.click();
+
+        await SLEEP(1500, 2500);
+
+        // ========================================================
+        // 检查 Renewal Restricted
+        // ========================================================
+
+        const pageText =
+            (
+                await this.page.locator(
+                    'body'
+                ).innerText()
+            ).toLowerCase();
 
         if (
-            renewRes.finalUrl &&
-            renewRes.finalUrl.includes(
-                '/invoice/'
+            pageText.includes(
+                'renewal restricted'
+            ) ||
+            pageText.includes(
+                'can only renew'
             )
         ) {
             this.log(
-                '⚡️ 续期成功，进入账单'
+                '⏳ 当前尚未到允许续期时间'
             );
 
-            isPaid =
-                await this.payFromHtml(
-                    renewRes.data,
-                    renewRes.finalUrl
-                );
-        } else {
-            this.log(
-                '⚠️ 未直接跳转账单，检查未支付账单...'
-            );
+            this.stats.skipped++;
 
-            isPaid =
-                await this.checkUnpaidInvoices(
-                    serviceId
-                );
+            return this.state[
+                svcHash
+            ];
         }
 
-        if (isPaid) {
-            this.stats.success++;
+        // ========================================================
+        // Create Invoice
+        // ========================================================
 
+        this.log(
+            "🔎 查找 'Create Invoice'..."
+        );
+
+        const createInvoice =
+            this.page.locator(
+                'button:has-text("Create Invoice"), a:has-text("Create Invoice")'
+            ).first;
+
+        try {
+            await createInvoice.waitFor({
+                state: 'visible',
+                timeout: 15000
+            });
+        } catch {
             this.log(
-                '🔄 支付成功，重新获取到期日期...'
+                "❌ 'Create Invoice' 按钮没有出现"
             );
 
-            await SLEEP(2000, 3000);
+            await this.page.screenshot({
+                path: `invoice_modal_failed_${svcHash}.png`,
+                fullPage: true
+            });
 
-            const refreshRes =
-                await this.getPage(
-                    `/service/${serviceId}/manage`
-                );
-
-            const newDate =
-                this.extractDate(
-                    refreshRes.data
-                );
-
-            if (newDate) {
-                this.state[svcHash] =
-                    newDate;
-
-                this.log(
-                    `✅ 新到期时间: ${new Date(
-                        newDate
-                    ).toISOString()}`
-                );
-            }
-        } else {
             this.stats.failed++;
 
-            this.log(
-                '❌ 续期或支付未完成'
+            return this.state[
+                svcHash
+            ];
+        }
+
+        this.log(
+            "🖱️ 点击 'Create Invoice'..."
+        );
+
+        await createInvoice.click();
+
+        // ========================================================
+        // 等待 Invoice 页面
+        // ========================================================
+
+        let invoiceReady = false;
+
+        const start =
+            Date.now();
+
+        while (
+            Date.now() - start <
+            90000
+        ) {
+            await this.handleCloudflare(
+                15000
+            );
+
+            const currentUrl =
+                this.page.url();
+
+            if (
+                currentUrl.includes(
+                    '/payment/invoice/'
+                ) ||
+                currentUrl.includes(
+                    '/invoice/'
+                )
+            ) {
+                invoiceReady = true;
+
+                this.log(
+                    `🎉 已进入账单页面: ${currentUrl}`
+                );
+
+                break;
+            }
+
+            await SLEEP(
+                1000,
+                2000
             );
         }
+
+        if (!invoiceReady) {
+            this.log(
+                '❌ 90 秒内没有进入 Invoice 页面'
+            );
+
+            await this.page.screenshot({
+                path: `invoice_timeout_${svcHash}.png`,
+                fullPage: true
+            });
+
+            this.stats.failed++;
+
+            return this.state[
+                svcHash
+            ];
+        }
+
+        // ========================================================
+        // 查找 Pay
+        // ========================================================
+
+        await this.handleCloudflare();
+
+        this.log(
+            "🔎 查找 'Pay' 按钮..."
+        );
+
+        const payButton =
+            this.page.locator(
+                'a:has-text("Pay"):visible, button:has-text("Pay"):visible'
+            ).first;
+
+        try {
+            await payButton.waitFor({
+                state: 'visible',
+                timeout: 30000
+            });
+        } catch {
+            this.log(
+                "❌ 未找到 'Pay' 按钮"
+            );
+
+            await this.page.screenshot({
+                path: `pay_button_missing_${svcHash}.png`,
+                fullPage: true
+            });
+
+            this.stats.failed++;
+
+            return this.state[
+                svcHash
+            ];
+        }
+
+        await payButton.scrollIntoViewIfNeeded();
+
+        this.log(
+            "🖱️ 点击 'Pay'..."
+        );
+
+        await payButton.click();
+
+        await SLEEP(4000, 6000);
+
+        await this.handleCloudflare();
+
+        // ========================================================
+        // 回到服务页面
+        // ========================================================
+
+        this.log(
+            '🔄 返回服务管理页面...'
+        );
+
+        const refresh =
+            await this.getService(
+                serviceId
+            );
+
+        const newDate =
+            this.extractDate(
+                refresh.html
+            );
+
+        if (newDate) {
+            this.state[svcHash] =
+                newDate;
+
+            this.log(
+                `🎉 新到期时间: ${new Date(
+                    newDate
+                ).toISOString()}`
+            );
+        }
+
+        this.stats.success++;
+
+        this.log(
+            '✅ 服务续期流程完成'
+        );
 
         return this.state[
             svcHash
         ];
     }
 
-    async checkUnpaidInvoices(serviceId) {
-        await SLEEP(1500, 2500);
-
-        const res =
-            await this.getPage(
-                `/service/${serviceId}/invoices?where=unpaid`
-            );
-
-        if (res.status >= 400) {
-            this.log(
-                `⚠️ 查询账单失败: HTTP ${res.status}`
-            );
-
-            return false;
-        }
-
-        const $ = cheerio.load(
-            res.data
+    /**
+     * ============================================================
+     * 主流程
+     * ============================================================
+     */
+    async execute() {
+        this.log(
+            '🔍 初始化 API 状态...'
         );
 
-        const urls = new Set();
-
-        $('a[href*="/invoice/"]').each(
-            (i, el) => {
-                const href =
-                    $(el).attr('href');
-
-                if (
-                    href &&
-                    !href.includes(
-                        'download'
-                    )
-                ) {
-                    urls.add(href);
-                }
-            }
+        await SLEEP(
+            2000,
+            3000
         );
 
-        if (urls.size === 0) {
-            this.log(
-                '⚪ 没有未支付账单'
-            );
+        const html =
+            await this.getDashboard();
 
-            return false;
+        // ========================================================
+        // CSRF
+        // ========================================================
+
+        const $ =
+            cheerio.load(html);
+
+        this.csrfToken =
+            $('meta[name="csrf-token"]')
+                .attr('content') ||
+            $('input[name="_token"]')
+                .first()
+                .val() ||
+            '';
+
+        if (this.csrfToken) {
+            this.log(
+                '🔐 CSRF Token 已获取'
+            );
         }
 
-        let paidAny = false;
+        // ========================================================
+        // 获取 Server ID
+        // ========================================================
 
-        for (const url of urls) {
-            this.log(
-                '📄 打开未支付账单...'
+        const services =
+            this.discoverServices(
+                html
             );
 
-            const invRes =
-                await this.getPage(
-                    url
-                );
-
-            const success =
-                await this.payFromHtml(
-                    invRes.data,
-                    invRes.finalUrl || url
-                );
-
-            if (success) {
-                paidAny = true;
-            }
-
-            await SLEEP(2000, 3000);
-        }
-
-        return paidAny;
-    }
-
-    async payFromHtml(html, url) {
-        const $ = cheerio.load(
-            html
-        );
-
-        let targetForm = null;
-        let action = '';
-
-        $('form').each(
-            (i, form) => {
-                const btnText =
-                    $(form)
-                        .find(
-                            'button, input[type="submit"]'
-                        )
-                        .text()
-                        .trim()
-                        .toLowerCase();
-
-                const formText =
-                    $(form)
-                        .text()
-                        .trim()
-                        .toLowerCase();
-
-                const act =
-                    $(form).attr(
-                        'action'
-                    ) || '';
-
-                if (
-                    (
-                        btnText.includes(
-                            'pay'
-                        ) ||
-                        btnText.includes(
-                            '支付'
-                        ) ||
-                        formText.includes(
-                            'pay invoice'
-                        )
-                    ) &&
-                    act &&
-                    !act.includes(
-                        'balance/add'
-                    )
-                ) {
-                    targetForm =
-                        $(form);
-
-                    action = act;
-
-                    return false;
-                }
-            }
-        );
-
-        if (!targetForm) {
-            this.log(
-                '⚪ 未找到支付表单（可能已经支付）'
-            );
-
-            return true;
-        }
-
-        const params =
-            new URLSearchParams();
-
-        targetForm
-            .find('input')
-            .each((i, el) => {
-                const name =
-                    $(el).attr(
-                        'name'
-                    );
-
-                if (!name) return;
-
-                const type =
-                    (
-                        $(el).attr(
-                            'type'
-                        ) || ''
-                    ).toLowerCase();
-
-                if (
-                    type === 'checkbox' &&
-                    !$(el).is(':checked')
-                ) {
-                    return;
-                }
-
-                params.append(
-                    name,
-                    $(el).val() || ''
-                );
-            });
+        this.stats.total =
+            services.length;
 
         this.log(
-            '💳 提交支付...'
+            `✅ 发现 ${services.length} 个服务`
         );
-
-        const res =
-            await this.postPage(
-                action,
-                params.toString()
-            );
 
         if (
-            res.status >= 200 &&
-            res.status < 400
+            services.length === 0
         ) {
-            this.log(
-                '✅ 支付请求成功'
+            await this.diagnose(
+                html
             );
 
-            return true;
+            return {
+                stats: this.stats,
+                newState: this.state,
+                latestDueDate: null
+            };
         }
 
-        this.log(
-            `⚠️ 支付响应异常: ${res.status}`
-        );
+        // ========================================================
+        // 逐个续期
+        // ========================================================
 
-        return false;
+        for (
+            const serviceId
+            of services
+        ) {
+            try {
+                const finalDate =
+                    await this.processService(
+                        serviceId
+                    );
+
+                if (
+                    finalDate &&
+                    finalDate >
+                        this.latestDueDate
+                ) {
+                    this.latestDueDate =
+                        finalDate;
+                }
+            } catch (error) {
+                this.stats.failed++;
+
+                this.log(
+                    `❌ 服务处理异常: ${error.message}`
+                );
+            }
+        }
+
+        return {
+            stats: this.stats,
+            newState: this.state,
+            latestDueDate:
+                this.latestDueDate === 0
+                    ? null
+                    : this.latestDueDate
+        };
     }
 }
 
